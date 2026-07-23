@@ -142,6 +142,8 @@ struct THPFunction {
 
   // True only while the user's forward/setup_context is running.
   bool grad_dtype_api_active = false;
+  // Owned Setter recording, consumed while wrapping outputs.
+  PyObject* output_grad_dtypes = nullptr;
 
   PyObject* saved_for_forward;
   // The C++ PyNode for this THPFunction. Ownership follows the same

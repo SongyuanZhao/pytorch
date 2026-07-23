@@ -14,6 +14,7 @@
 
 #include <ATen/FuncTorchTLS.h>
 #include <ATen/functorch/DynamicLayer.h>
+#include <torch/csrc/Dtype.h>
 #include <torch/csrc/DynamicTypes.h>
 #include <torch/csrc/Exceptions.h>
 #include <torch/csrc/THP.h>
@@ -587,6 +588,7 @@ static int THPFunction_traverse(THPFunction* self, visitproc visit, void* arg) {
   Py_VISIT(self->dirty_tensors);
   Py_VISIT(self->compiled_autograd_backward_state);
   Py_VISIT(self->saved_for_forward);
+  Py_VISIT(self->output_grad_dtypes);
   return traverse_node(self->cdata, visit, arg);
 }
 
@@ -597,6 +599,7 @@ static int THPFunction_clear(THPFunction* self) {
   Py_CLEAR(self->dirty_tensors);
   Py_CLEAR(self->compiled_autograd_backward_state);
   Py_CLEAR(self->saved_for_forward);
+  Py_CLEAR(self->output_grad_dtypes);
   return 0;
 }
 
@@ -641,6 +644,7 @@ static PyObject* THPFunction_new(
   self->clear_saved_tensors_on_access = false;
   self->saved_tensors_accessed_and_cleared = false;
   self->grad_dtype_api_active = false;
+  self->output_grad_dtypes = nullptr;
   torch::utils::PyObjectPreservation::init_fresh_nonatomic(*self->cdata, obj);
   return obj;
 }
@@ -687,6 +691,35 @@ static std::unordered_set<at::TensorImpl*> _mark_dirty(THPFunction* self) {
 static std::unordered_set<at::TensorImpl*> _parse_non_differentiable(
     THPFunction* self);
 
+// Resolve the setter's (output, dtype) recording, matched to output slots by
+// Python object identity. Reads the explicit ctx field populated by
+// _set_output_grad_dtype; empty when the setter was never called.
+static std::unordered_map<PyObject*, std::optional<at::ScalarType>>
+_parse_output_grad_dtypes(THPFunction* self) {
+  std::unordered_map<PyObject*, std::optional<at::ScalarType>> map;
+  PyObject* pairs = self->output_grad_dtypes;
+  if (pairs == nullptr) {
+    return map;
+  }
+  Py_ssize_t num = PyList_GET_SIZE(pairs);
+  map.reserve(num);
+  for (const auto i : c10::irange(num)) {
+    PyObject* pair = PyList_GET_ITEM(pairs, i);
+    PyObject* t = PyTuple_GET_ITEM(pair, 0);
+    PyObject* d = PyTuple_GET_ITEM(pair, 1);
+    std::optional<at::ScalarType> dtype;
+    if (d != Py_None) {
+      dtype = reinterpret_cast<THPDtype*>(d)->scalar_type;
+    }
+    auto [it, inserted] = map.emplace(t, dtype);
+    THPFunction_assert(
+        inserted || it->second == dtype,
+        "set_output_grad_dtype received conflicting grad dtypes for the same "
+        "output tensor");
+  }
+  return map;
+}
+
 // Given a Python tuple of raw output tensors (raw_output), set each of
 // the corresponding entries in a different Python tuple (outputs) with
 // these tensors wrapped with variables.  We save the gradient function (self)
@@ -725,6 +758,30 @@ static void _wrap_outputs(
     } else {
       raw_output_vars.emplace_back();
     }
+  }
+
+  auto output_grad_dtypes = _parse_output_grad_dtypes(self);
+  std::unordered_set<PyObject*> matched_output_grad_dtypes;
+  for (const auto i : c10::irange(num_outputs)) {
+    PyObject* obj = PyTuple_GET_ITEM(raw_output, i);
+    if (output_grad_dtypes.find(obj) == output_grad_dtypes.end()) {
+      continue;
+    }
+    matched_output_grad_dtypes.insert(obj);
+    const auto& raw_output_var = raw_output_vars[i];
+    THPFunction_assert(
+        raw_output_var.has_value() &&
+            non_differentiable.count(raw_output_var->unsafeGetTensorImpl()) ==
+                0 &&
+            isDifferentiableType(raw_output_var->scalar_type()),
+        "set_output_grad_dtype can only be used with a differentiable tensor "
+        "output");
+  }
+  for (const auto& declaration : output_grad_dtypes) {
+    THPFunction_assert(
+        matched_output_grad_dtypes.count(declaration.first) != 0,
+        "set_output_grad_dtype expected the provided tensor to be one of the "
+        "Function outputs");
   }
 
   _jvp_fn_t jvp_user_function = [self](
@@ -822,6 +879,7 @@ static void _wrap_outputs(
   for (const auto i : c10::irange(num_outputs)) {
     PyObject* obj = PyTuple_GetItem(raw_output, i);
     auto& wrapped_output = wrapped_outputs[i];
+    auto output_grad_dtype = output_grad_dtypes.find(obj);
     // Keep the non-tensor outputs as is.
     if (!THPVariable_Check(obj) || !wrapped_output.has_value()) {
       if (is_executable) {
@@ -841,6 +899,10 @@ static void _wrap_outputs(
         bool use_zeros_like =
             is_differentiable && num_outputs > 1 && wrapped_output->is_nested();
         self->output_info.emplace_back(wrapped_output.value(), use_zeros_like);
+        if (output_grad_dtype != output_grad_dtypes.end()) {
+          cdata_if_executable->mutable_input_metadata(i).set_grad_dtype(
+              output_grad_dtype->second);
+        }
       }
       PyTuple_SetItem(
           outputs, i, THPVariable_Wrap(std::move(wrapped_output.value())));
@@ -1569,6 +1631,7 @@ static PyObject* resolve_kwargs_to_positional(
 struct GradDtypeApiGuard {
   explicit GradDtypeApiGuard(THPFunction* ctx) : ctx_(ctx) {
     TORCH_INTERNAL_ASSERT(!ctx_->grad_dtype_api_active);
+    TORCH_INTERNAL_ASSERT(ctx_->output_grad_dtypes == nullptr);
     ctx_->grad_dtype_api_active = true;
   }
   GradDtypeApiGuard(const GradDtypeApiGuard&) = delete;
@@ -1580,11 +1643,60 @@ struct GradDtypeApiGuard {
 
   ~GradDtypeApiGuard() {
     end_user_phase();
+    if (ctx_->output_grad_dtypes != nullptr) {
+      // Preserve an in-flight Python error while releasing the recording.
+      PyObject *type = nullptr, *value = nullptr, *traceback = nullptr;
+      PyErr_Fetch(&type, &value, &traceback);
+      Py_CLEAR(ctx_->output_grad_dtypes);
+      PyErr_Restore(type, value, traceback);
+    }
   }
 
  private:
   THPFunction* ctx_;
 };
+
+// Records an output declaration for _wrap_outputs to match by object identity.
+// The native phase check also protects direct calls to this underscore method.
+static PyObject* THPFunction_set_output_grad_dtype(
+    PyObject* self_,
+    PyObject* args) {
+  HANDLE_TH_ERRORS
+  auto* self = reinterpret_cast<THPFunction*>(self_);
+  TORCH_CHECK(
+      self->grad_dtype_api_active,
+      "set_output_grad_dtype can only be called from the forward or "
+      "setup_context methods of an autograd.Function.");
+  PyObject* output = nullptr;
+  PyObject* dtype = nullptr;
+  if (!PyArg_ParseTuple(args, "OO", &output, &dtype)) {
+    return nullptr;
+  }
+  TORCH_CHECK(
+      THPVariable_Check(output),
+      "set_output_grad_dtype expects a tensor output, but got ",
+      THPUtils_typename(output));
+  TORCH_CHECK(
+      dtype == Py_None || THPDtype_Check(dtype),
+      "set_output_grad_dtype expects dtype to be a torch.dtype or None, but "
+      "got ",
+      THPUtils_typename(dtype));
+  if (self->output_grad_dtypes == nullptr) {
+    self->output_grad_dtypes = PyList_New(0);
+    if (!self->output_grad_dtypes) {
+      return nullptr;
+    }
+  }
+  THPObjectPtr pair(PyTuple_Pack(2, output, dtype));
+  if (!pair) {
+    return nullptr;
+  }
+  if (PyList_Append(self->output_grad_dtypes, pair.get()) < 0) {
+    return nullptr;
+  }
+  Py_RETURN_NONE;
+  END_HANDLE_TH_ERRORS
+}
 
 PyObject* THPFunction_apply(PyObject* cls, PyObject* args, PyObject* kwargs) {
   HANDLE_TH_ERRORS
@@ -2157,6 +2269,10 @@ static struct PyMethodDef THPFunction_methods[] = {
     {(char*)"_get_compiled_autograd_symints",
      THPFunction_get_compiled_autograd_symints,
      METH_NOARGS,
+     nullptr},
+    {(char*)"_set_output_grad_dtype",
+     THPFunction_set_output_grad_dtype,
+     METH_VARARGS,
      nullptr},
     {nullptr}};
 

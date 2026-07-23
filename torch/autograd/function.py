@@ -232,6 +232,38 @@ class FunctionCtx:
         """
         self.non_differentiable = args
 
+    def set_output_grad_dtype(
+        self, output: torch.Tensor, dtype: torch.dtype | None
+    ) -> None:
+        r"""Declare the gradient dtype for one of this Function's outputs.
+
+        This should be called from either the :func:`setup_context` or
+        :func:`forward` methods, and the same ``output`` Tensor object must be
+        among the tensors this Function returns. This lets a Function define
+        the dtype contract for gradients entering its output slots independently
+        of the outputs' storage dtypes. If the same Tensor object is returned
+        more than once, the declaration applies to every corresponding slot.
+
+        The dtype has the following meaning:
+
+        - a concrete :class:`torch.dtype`: the incoming gradient is converted to
+          that dtype.
+        - ``None``: no conversion is performed; the gradient passes through
+          as-is.
+
+        If not called, the incoming gradient is converted to the output's dtype.
+
+        For example::
+
+            >>> # xdoctest: +SKIP
+            >>> @staticmethod
+            >>> def forward(ctx, x):
+            >>>     out = x.to(torch.bfloat16)
+            >>>     ctx.set_output_grad_dtype(out, torch.float32)
+            >>>     return out
+        """
+        self._set_output_grad_dtype(output, dtype)
+
     def set_materialize_grads(self, value: bool):
         r"""Set whether to materialize grad tensors. Default is ``True``.
 
