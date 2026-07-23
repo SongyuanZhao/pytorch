@@ -140,6 +140,9 @@ struct THPFunction {
   bool clear_saved_tensors_on_access;
   bool saved_tensors_accessed_and_cleared;
 
+  // True only while the user's forward/setup_context is running.
+  bool grad_dtype_api_active = false;
+
   PyObject* saved_for_forward;
   // The C++ PyNode for this THPFunction. Ownership follows the same
   // pattern as TensorImpl/THPVariable: THPFunction holds a strong

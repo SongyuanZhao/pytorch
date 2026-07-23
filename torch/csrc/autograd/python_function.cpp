@@ -640,6 +640,7 @@ static PyObject* THPFunction_new(
   self->materialize_non_diff_grads = true;
   self->clear_saved_tensors_on_access = false;
   self->saved_tensors_accessed_and_cleared = false;
+  self->grad_dtype_api_active = false;
   torch::utils::PyObjectPreservation::init_fresh_nonatomic(*self->cdata, obj);
   return obj;
 }
@@ -1562,6 +1563,29 @@ static PyObject* resolve_kwargs_to_positional(
   return result.release();
 }
 
+// Marks the user phase in which grad-dtype ctx APIs may be called. The explicit
+// end closes the phase before output wrapping; the destructor handles early
+// exits.
+struct GradDtypeApiGuard {
+  explicit GradDtypeApiGuard(THPFunction* ctx) : ctx_(ctx) {
+    TORCH_INTERNAL_ASSERT(!ctx_->grad_dtype_api_active);
+    ctx_->grad_dtype_api_active = true;
+  }
+  GradDtypeApiGuard(const GradDtypeApiGuard&) = delete;
+  GradDtypeApiGuard& operator=(const GradDtypeApiGuard&) = delete;
+
+  void end_user_phase() {
+    ctx_->grad_dtype_api_active = false;
+  }
+
+  ~GradDtypeApiGuard() {
+    end_user_phase();
+  }
+
+ private:
+  THPFunction* ctx_;
+};
+
 PyObject* THPFunction_apply(PyObject* cls, PyObject* args, PyObject* kwargs) {
   HANDLE_TH_ERRORS
 
@@ -1657,6 +1681,8 @@ PyObject* THPFunction_apply(PyObject* cls, PyObject* args, PyObject* kwargs) {
 
   auto num_args = PyTuple_GET_SIZE(inputs);
 
+  GradDtypeApiGuard grad_dtype_guard(ctx);
+
   // Call forward
   THPObjectPtr output;
   {
@@ -1691,6 +1717,9 @@ PyObject* THPFunction_apply(PyObject* cls, PyObject* args, PyObject* kwargs) {
     if (!output)
       return nullptr;
   }
+
+  // Close the public API before output wrapping can run user jvp callbacks.
+  grad_dtype_guard.end_user_phase();
 
   return process_outputs(
       cls,
